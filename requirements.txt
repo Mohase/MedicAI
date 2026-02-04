@@ -1,0 +1,10 @@
+numpy 
+pandas 
+matplotlib 
+pydicom 
+tqdm
+pyarrow
+torch
+torchvision
+scikit-image
+
