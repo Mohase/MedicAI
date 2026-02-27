@@ -28,3 +28,6 @@ Thumbs.db
 .env
 .env.local
 *.pem
+
+# Temp
+.git_commit_msg.txt

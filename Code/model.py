@@ -198,19 +198,150 @@ class DualDecoder(nn.Module):
         self.out_size_w = out_size_w
 
         # Path A: patch tokens -> expand to spatial, then same structure
+        # Shortcut connections are used between each block -> residual 
         self.path_a_blocks = nn.ModuleList()
+        self.path_a_shortcuts = nn.ModuleList()
         in_ch = embed_dim # input channels
         for skip_ch, dec_ch in zip(skip_channels, decode_channels):
             self.path_a_blocks.append(self._make_decoder_block(in_ch, skip_ch, dec_ch))
+            self.path_a_shortcuts.append(nn.Conv2d(in_ch + skip_ch, dec_ch, 1))
             in_ch = dec_ch
             
         # Path B: class token -> expand to spatial, then same structure
         self.path_b_proj = nn.Conv2d(embed_dim, embed_dim, 1)
         self.path_b_blocks = nn.ModuleList()
+        self.path_b_shortcuts = nn.ModuleList()
         in_ch = embed_dim
         for skip_ch, dec_ch in zip(skip_channels, decode_channels):
             self.path_b_blocks.append(self._make_decoder_block(in_ch, skip_ch, dec_ch))
+            self.path_b_shortcuts.append(nn.Conv2d(in_ch + skip_ch, dec_ch, 1))
             in_ch = dec_ch
 
         self.head_a = nn.Conv2d(decode_channels[-1], 1, 1)
         self.head_b = nn.Conv2d(decode_channels[-1], 1, 1)
+
+    def _upsample_and_concat(self, x, skip, block, shortcut):
+        """ Upsample, concat with skip, double conv, then add residual as per paper. """
+        x = F.interpolate(x, size=skip.shape[2:], mode="bilinear", align_corners=False)
+        concat = torch.cat([x, skip], dim=1)
+        return block(concat) + shortcut(concat)
+
+    def forward(self, patch_tokens, class_token, encoder_skips):
+        B = patch_tokens.shape[0]
+        # Path A: (B, N, D) -> (B, D, h, w)
+        # B = batch size
+        # N = number of tokens (num_patches)
+        # D = embed_dim (length of each token vector)
+        a = patch_tokens.transpose(1, 2).reshape(B, self.embed_dim, self.patch_grid_h, self.patch_grid_w)
+        for block, shortcut, skip in zip(self.path_a_blocks, self.path_a_shortcuts, encoder_skips):
+            a = self._upsample_and_concat(a, skip, block, shortcut)
+        logits_a = self.head_a(a)
+        logits_a = F.interpolate(logits_a, size=(self.out_size_h, self.out_size_w), mode="bilinear", align_corners=False)
+
+        # Path B: class token (B, 1, D) -> (B, D, h, w)
+        b = class_token.transpose(1, 2).reshape(B, self.embed_dim, 1, 1)
+        b = b.repeat(1, 1, self.patch_grid_h, self.patch_grid_w)
+        b = self.path_b_proj(b)
+        for block, shortcut, skip in zip(self.path_b_blocks, self.path_b_shortcuts, encoder_skips):
+            b = self._upsample_and_concat(b, skip, block, shortcut)
+        logits_b = self.head_b(b)
+        logits_b = F.interpolate(logits_b, size=(self.out_size_h, self.out_size_w), mode="bilinear", align_corners=False)
+
+        return logits_a, logits_b 
+
+
+# =============================
+# 5. FDR-TRANSUNET (main model)
+# =============================
+
+class FDRTransUNet(nn.Module):
+    """
+    Full model per paper: Encoder (FDR) -> Patch Embed -> Transformer -> Dual Decoder.
+    Deep supervision: Two outputs (Path A + Path B); combined mask; residual shortcuts in decoder.
+    """
+    def __init__(
+        self,
+        in_channels=1,
+        encoder_channels=(32, 64, 128, 256),
+        embed_dim=256,
+        num_heads=8,
+        num_layers=6,
+        patch_size=1,
+        mlp_ratio=4.0,
+        dropout=0.1,
+        input_h=256,
+        input_w=256,
+    ):
+
+        super(FDRTransUNet, self).__init__()
+        self.input_h, self.input_w = input_h, input_w
+        self.encoder_channels = list(encoder_channels)
+        self.embed_dim = embed_dim
+
+        # Stem: 256 -> 128
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, encoder_channels[0], 7, stride=2, padding=3),
+            nn.BatchNorm2d(encoder_channels[0]),
+            nn.ReLU(inplace=True),
+        )
+
+        # Encoder: FDR stages + downsample -> 128 -> 64 -> 32 -> 16
+        self.encoder_stages = nn.ModuleList()
+        self.downsample = nn.ModuleList()
+        ch = encoder_channels[0]
+        for out_ch in encoder_channels[1:]:
+            self.encoder_stages.append(FDRBlock(ch, out_ch))
+            self.downsample.append(nn.Sequential(
+                nn.Conv2d(out_ch, out_ch, 3, stride=2, padding=1),
+                nn.BatchNorm2d(out_ch),
+                nn.ReLU(inplace=True),
+            ))
+            ch = out_ch
+        self.encoder_stages.append(FDRBlock(ch,ch))
+        self.bottleneck_channels = ch
+
+        self.patch_grid_h = input_h // 16
+        self.patch_grid_w = input_w // 16
+        num_patches = self.patch_grid_h * self.patch_grid_w
+
+        self.patch_embed = PatchEmbedding(self.bottleneck_channels, embed_dim, patch_size, num_patches)
+        self.transformer = TransformerEncoder(embed_dim, num_heads, num_layers, mlp_ratio, dropout)
+
+        skip_ch = [encoder_channels[-1], encoder_channels[-2], encoder_channels[-3], encoder_channels[-4]]
+        decode_ch = [256, 128, 64, 32]
+        self.decoder = DualDecoder(
+            embed_dim=embed_dim,
+            skip_channels=skip_ch,
+            decode_channels=decode_ch,
+            out_size_h=input_h,
+            out_size_w=input_w,
+            patch_grid_h=self.patch_grid_h,
+            patch_grid_w=self.patch_grid_w,
+        )
+
+    def _encoder_forward(self, x):
+        skips = []
+        x = self.stem(x)
+        skips.append(x)
+        for stage, down in zip(self.encoder_stages[:-1], self.downsample):
+            x = stage(x)
+            skips.append(x)
+            x = down(x)
+        x = self.encoder_stages[-1](x)
+        return x, skips
+    
+
+    def forward(self, x):
+        enc_out, skips = self._encoder_forward(x)
+        encoder_skips = [skips[-1], skips[-2], skips[-3], skips[-4]]
+
+        patches = self.patch_embed(enc_out)
+        tokens = self.transformer(patches)
+        class_tok = tokens[:, 0:1, :]
+        patch_tok = tokens[:, 1:, :]
+
+        logits_a, logits_b = self.decoder(patch_tok, class_tok, encoder_skips)
+        combined = (logits_a + logits_b) / 2.0
+
+        return combined, logits_a, logits_b
+        
