@@ -117,19 +117,36 @@ class PneumothoraxDataset(Dataset):
 
         return image, mask 
     
-def create_train_val_split(df, val_ratio=0.2, random_seed=42):
-    """Split DataFrame into train and validation sets"""
-    # Shuffling the DataFrame
+def create_train_val_test_split(df, train_ratio=0.6, val_ratio=0.2, test_ratio=0.2, random_seed=42):
+    """
+    Split DataFrame into train(60%), validation(20%) and test(20%) sets.
+    Validation is used for early stopping and model selection;
+        test is held out for final evaluation only.
+    
+    """
+    # Ensure correct ratios and allow for tiny float error
+    assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, "Ratios must sum to 1.0"
+
+    # Shuffle rows so train/val/test are random; fixed seed for reproducibility
     df_shuffled = df.sample(frac=1, random_state=random_seed).reset_index(drop=True)
+    n = len(df_shuffled)
+
+    # Number of rows for each split (train and val use ratios; test gets rest)
+    n_train = int(n * train_ratio)
+    n_val = int(n * val_ratio)
+    n_test = n - n_train - n_val
 
     # Calculate split point 
     val_size = int(len(df_shuffled) * val_ratio)
 
-    # Split into train and validation
-    train_df = df_shuffled[:-val_size]
-    val_df = df_shuffled[-val_size:]
+    # Split into train, val and test in contiguous chunks: [0:n_train], [n_train:n_train+n_val], [n_train+n_val:]
+    train_df = df_shuffled[:n_train]
+    val_df   = df_shuffled[n_train:n_train + n_val]
+    test_df  = df_shuffled[n_train + n_val:]
 
     print(f"Train: {len(train_df)} samples")
     print(f"Validation: {len(val_df)} samples")
+    print(f"Test: {len(test_df)} samples")
 
-    return train_df, val_df
+
+    return train_df, val_df, test_df
