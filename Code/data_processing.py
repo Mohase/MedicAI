@@ -3,6 +3,7 @@
 import pandas as pd
 import pydicom
 import os 
+import socket
 from tqdm import tqdm
 import config
 
@@ -121,8 +122,30 @@ def find_dicom_file(file_id, image_directory=None):
     return None
 
 def load_dicom_image(file_path):
-    """Load DICOM image and return pixel array and DICOM object"""
-    dicom = pydicom.dcmread(file_path)
+    """Load DICOM image and return pixel array and DICOM object.
+
+    Uses force=True so files missing the DICOM File Meta header (e.g. some SIIM
+    files) can still be read. When file_meta is incomplete (no Transfer Syntax UID),
+    sets a default so pixel data can be decoded. Wraps pydicom.dcmread so that I/O
+    timeouts are surfaced as TimeoutError, allowing the dataset to skip problematic files.
+    """
+    try:
+        dicom = pydicom.dcmread(file_path, force=True)
+    except TimeoutError as e:
+        raise TimeoutError(f"Timeout reading DICOM: {file_path}") from e
+    except (OSError, socket.timeout) as e:
+        raise TimeoutError(f"I/O error reading DICOM: {file_path}") from e
+
+    # force=True can leave file_meta without Transfer Syntax UID, so pixel_array fails.
+    # Set a default (Implicit VR Little Endian) so decoding can proceed.
+    try:
+        from pydicom.uid import ImplicitVRLittleEndian
+        file_meta = getattr(dicom, "file_meta", None)
+        if file_meta is not None and not getattr(file_meta, "TransferSyntaxUID", None):
+            file_meta.TransferSyntaxUID = ImplicitVRLittleEndian
+    except Exception:
+        pass
+
     return dicom.pixel_array, dicom
 
 

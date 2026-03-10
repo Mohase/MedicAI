@@ -19,10 +19,10 @@ The following are parameters that were not found in the paper but were chosen ba
 - ViT training best practices (gradient clipping prevents exploding gradients) -> sugguestion 
 
 """
-import os 
+import os
 import sys
+import json
 
-from torch.cuda import current_blas_handle
 
 # ------------------------------------------------------------------
 # Make sure Python can find our modules (model, dataset, config, etc.)
@@ -39,6 +39,8 @@ import config
 import data_processing
 from dataset import PneumothoraxDataset, create_train_val_test_split
 from model import FDRTransUNet
+from tqdm import tqdm
+from plot_curves import plot_training_curves
 
 # =============================
 # HYPERPARAMETERS
@@ -130,19 +132,19 @@ def dice_score(pred_logits, mask, threshold=PIXEL_TRESHOLD):
     intersection = (prediction * mask_bin).sum(dim=(1, 2, 3))
 
     # Total positives: number of predicted 1s + number of mask 1s, per sample
-    total = prediction.sum(dim=(1, 2, 3)) + mask_bin.sum(dim(1, 2, 3))
+    total = prediction.sum(dim=(1, 2, 3)) + mask_bin.sum(dim=(1, 2, 3))
 
     # Dice = 2*overlap / total; 1e-6 avoids divide-by-zero when both empty
     dice = (2.0 * intersection + 1e-6) / (total + 1e-6)
 
     # Return single scalar; mean Dice over batch as a Python float (e.g. for logging)
-    return dice.mean().item
+    return dice.mean().item()
 
 def iou_score(pred_logits, mask, threshold=PIXEL_TRESHOLD):
     """
     IoU: Intersection over Union, aka Jaccard index. 
     Range: 0 to 1. Stricter than Dice (always <= Dice for same prediction).
-    Fromula: |pred ∩ mask| / |pred ∪ mask|
+    Formula: |pred ∩ mask| / |pred ∪ mask|
 
     Paper uses mIoU (mean IoU) as the primary validation metric
     for early stopping and model selection.
@@ -166,9 +168,36 @@ def iou_score(pred_logits, mask, threshold=PIXEL_TRESHOLD):
 
     # Return single scalar; mean IoU over batch, as Python float 
     return iou.mean().item()
-    
-# FYI: .item() takes a one-element PyTorch tensor and returns that value as a Python number (int / float)
-# e.g. tensor(0.5) -> 0.5 ; normal Python float. If more than one elment in tensor, raises error. 
+
+def precision_score(pred_logits, mask, threshold=PIXEL_TRESHOLD):
+    """
+    Precision: of all pixels predicted positive, how many are truly positive.
+    Formula: TP / (TP + FP)
+    Paper reports this in Tables 2 and 3.
+    """
+    prediction = (torch.sigmoid(pred_logits) > threshold).float()
+    mask_bin = (mask > threshold).float()
+
+    tp = (prediction * mask_bin).sum(dim=(1, 2, 3))
+    predicted_pos = prediction.sum(dim=(1, 2, 3))
+
+    precision = (tp + 1e-6) / (predicted_pos + 1e-6)
+    return precision.mean().item()
+
+def recall_score(pred_logits, mask, threshold=PIXEL_TRESHOLD):
+    """
+    Recall: of all truly positive pixels, how many did we predict correctly.
+    Formula: TP / (TP + FN)
+    Paper reports this in Tables 2 and 3.
+    """
+    prediction = (torch.sigmoid(pred_logits) > threshold).float()
+    mask_bin = (mask > threshold).float()
+
+    tp = (prediction * mask_bin).sum(dim=(1, 2, 3))
+    actual_pos = mask_bin.sum(dim=(1, 2, 3))
+
+    recall = (tp + 1e-6) / (actual_pos + 1e-6)
+    return recall.mean().item()
 
 
 # =============================
@@ -202,7 +231,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
     model.train() # sets model to training mode (enables dropout, batch norm updates)
     total_loss = 0.0
 
-    for images, masks in loader:
+    for images, masks in tqdm(loader, desc="Train", leave=False):
         images, masks = images.to(device), masks.to(device)
 
         optimizer.zero_grad() # clear out old gradients
@@ -236,43 +265,47 @@ def validate(model, loader, criterion, device):
     """
     Evaluate on validation set WITHOUT updating weights.
 
-    Returns: val_loss, val_dice, val_miou
+    Returns: val_loss, val_dice, val_miou, val_precision, val_recall
 
-    Paper uses mIoU as the metric for early stopping, 
-    so we compute and return it here. 
+    Paper uses mIoU as the metric for early stopping.
+    Precision and Recall are reported in Tables 2 and 3. 
     """
-    # Put the model into evaluation mode
     model.eval()
     total_loss = 0.0
     total_dice = 0.0
     total_iou  = 0.0
-    n = 0 # number of validation batches 
+    total_prec = 0.0
+    total_rec  = 0.0
+    n = 0
 
-    # no gradient computation needed in validation. Saves memory + speed 
     with torch.no_grad(): 
         for images, masks in loader:
             images, masks = images.to(device), masks.to(device)
 
-            # Use combined output for validation (average of both paths)
             combined, _, _ = model(images)
 
-            # accumulate loss
             total_loss += criterion(combined, masks).item()
             total_dice += dice_score(combined, masks)
             total_iou  += iou_score(combined, masks)
+            total_prec += precision_score(combined, masks)
+            total_rec  += recall_score(combined, masks)
             n += 1
 
     if n == 0:
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0, 0.0
     
-    # return mean loss, dice and iou over batches
-    return total_loss / n, total_dice / n, total_iou/ n
+    return total_loss / n, total_dice / n, total_iou / n, total_prec / n, total_rec / n
 
 
 
 def main():
     # 1. Device: use GPU if available else CPU
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.backends.mps.is_available():
+        device = torch.device("mps")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
     print(f"Device: {device}")
 
     # 2. Load data, ensuring we have file_id
@@ -324,9 +357,18 @@ def main():
     model = FDRTransUNet(
         in_channels=1,
         encoder_channels=(32, 64, 128, 256),
-        embed_dim=256, num_head=8, num_layers=6, 
-        input_h=TARGET_SIZE[0], input_w=TARGET_SIZE[1],
+        embed_dim=768,
+        growth_rate=64,
+        num_heads=12,
+        num_layers=12,
+        input_h=TARGET_SIZE[0],
+        input_w=TARGET_SIZE[1],
     ).to(device)
+
+    # PARAMETERS
+    n = sum(p.numel() for p in model.parameters())
+    print(f"Model parameters: {n:,}\nModel parameters (Million): {n/1e6:.2f}")
+
 
     # 7. Loss, optimizer, scheduler (paper: BCEwithlogitsloss, Adam 3e-4, cosine warm restarts)
     criterion = torch.nn.BCEWithLogitsLoss()
@@ -350,17 +392,39 @@ def main():
     print(f"\nTraining up to {NUM_EPOCHS} epochs (batch_size={BATCH_SIZE}, lr={LR})")
     print(f"Early stop if no mIoU improvements for {EARLY_STOP_PATIENCE} epochs\n")
 
+    # --- History for training curves (convergence + metrics) ---
+    history = {
+        "train_loss": [], "val_loss": [],
+        "val_dice": [], "val_miou": [],
+        "val_precision": [], "val_recall": [],
+    }
+
     for epoch in range(NUM_EPOCHS):
         train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
-        val_loss, val_dice, val_miou = validate(model, val_loader, criterion, device)
+        val_loss, val_dice, val_miou, val_prec, val_rec = validate(
+            model, val_loader, criterion, device
+        )
         scheduler.step()
+
+        history["train_loss"].append(train_loss)
+        history["val_loss"].append(val_loss)
+        history["val_dice"].append(val_dice)
+        history["val_miou"].append(val_miou)
+        history["val_precision"].append(val_prec)
+        history["val_recall"].append(val_rec)
 
         if val_miou > best_miou:
             best_miou = val_miou
             patience_count = 0            
             os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-            torch.save(model.state_dict(), BEST_MODEL_PATH)
-            print(f"  (saved best model to {BEST_MODEL_PATH})")
+            torch.save({
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "best_miou": best_miou,
+            }, BEST_MODEL_PATH)
+            print(f"  (saved best checkpoint to {BEST_MODEL_PATH})")
         else:
             patience_count += 1
 
@@ -371,6 +435,8 @@ def main():
             f"  val_loss={val_loss:.4f}"
             f"  dice={val_dice:.4f}"
             f"  mIoU={val_miou:.4f}"
+            f"  prec={val_prec:.4f}"
+            f"  rec={val_rec:.4f}"
             f"  best_mIoU={best_miou:.4f}"
             f"  lr={current_lr:.6f}"
             f"  patience={patience_count}"
@@ -382,11 +448,32 @@ def main():
 
     print(f"\nTraining complete. Best validation mIoU: {best_miou:.4}")
 
+    # --- Save history to JSON so we can re-plot later without re-running training ---
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    history_path = os.path.join(CHECKPOINT_DIR, "training_history.json")
+    with open(history_path, "w") as f:
+        json.dump({"history": history, "best_miou": best_miou, "n_epochs": len(history["train_loss"])}, f, indent=2)
+    print(f"Saved training history to {history_path}")
+
+    # --- Plot training curves (loss + metrics) via shared function ---
+    curves_path = os.path.join(CHECKPOINT_DIR, "training_curves.png")
+    plot_training_curves(history, curves_path)
+    print(f"Saved training curves to {curves_path}")
+
     # 10. Final evalutaion on held_out test set
     # Test set was never used for training or early stopping
     test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
-    test_loss, test_dice, test_miou = validate(model, test_loader, criterion, device)
-    print(f"\nTest set loss={test_loss:.4f}\nTest dice={test_dice:.4f}\nTest mIoU={test_miou:.4f}")
+    test_loss, test_dice, test_miou, test_prec, test_rec = validate(
+        model, test_loader, criterion, device
+    )
+    print(
+        f"\nTest set results:"
+        f"\n  loss={test_loss:.4f}"
+        f"\n  dice={test_dice:.4f}"
+        f"\n  mIoU={test_miou:.4f}"
+        f"\n  precision={test_prec:.4f}"
+        f"\n  recall={test_rec:.4f}"
+    )
 
     return model, best_miou, test_miou
 

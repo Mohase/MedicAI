@@ -14,11 +14,9 @@ From code:
     save_overlay_and_mask("path/to/image.dcm", out, save_dir="outputs") 
 """
 
-from fileinput import filename
 import os
 import sys
 import numpy as np
-from numpy.matlib import outer
 import torch
 
 # Path setup: so we can run as "python Code/predict.py" from project root (Code)
@@ -27,7 +25,6 @@ if script_dir not in sys.path:
     sys.path.insert(0, script_dir)
 
 from skimage.transform import resize
-from Code.train import BEST_MODEL_PATH, CHECKPOINT_DIR, TARGET_SIZE
 import config
 import data_processing
 from model import FDRTransUNet
@@ -35,8 +32,13 @@ from model import FDRTransUNet
 # Must match training (model expects 256x256 input)
 TARGET_SIZE = (256, 256)
 CHECKPOINT_DIR = os.path.join(script_dir, "checkpoints")
-BEST_MODEL_PATH = os.path.join(script_dir, "best_model.pth")
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+BEST_MODEL_PATH = os.path.join(CHECKPOINT_DIR, "best_model.pth")
+if torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")
+elif torch.cuda.is_available():
+    DEVICE = torch.device("cuda")
+else:
+    DEVICE = torch.device("cpu")
 DEFAULT_SAVE_DIR = os.path.join(script_dir, "outputs")
 
 # Folder for test images; only the filename is given on CLI (or use default below).
@@ -50,16 +52,21 @@ def load_model():
     model = FDRTransUNet(
         in_channels=1,
         encoder_channels=(32, 64, 128, 256),
-        embed_dim=256,
-        num_heads=8,
-        num_layers=6,
+        embed_dim=768,
+        growth_rate=64,
+        num_heads=12,
+        num_layers=12,
         input_h=TARGET_SIZE[0],
-        input_W=TARGET_SIZE[1],
+        input_w=TARGET_SIZE[1],
     )
 
     if os.path.exists(BEST_MODEL_PATH):
-        # map location so it works on CPU if no GPU (e.g. Mac)
-        model.load_state_dict(torch.load(BEST_MODEL_PATH, map_location=DEVICE))
+        checkpoint = torch.load(BEST_MODEL_PATH, map_location=DEVICE)
+        # Supports both old (bare state_dict) and new (dict with metadata) formats
+        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+            model.load_state_dict(checkpoint["model_state_dict"])
+        else:
+            model.load_state_dict(checkpoint)
     else:
         raise FileNotFoundError(f"No checkpoint at {BEST_MODEL_PATH}. Train first.")
     model.to(DEVICE)
@@ -201,7 +208,7 @@ def save_overlay_and_mask(image_path_or_array, result, save_dir=None, base_name=
         img = img.astype(np.float32)
     if img.ndim == 3:
         img = img.mean(axis=2)
-    img = resize(img, TARGET_SIZE, preserve_range=True, anti_aliasting=True)
+    img = resize(img, TARGET_SIZE, preserve_range=True, anti_aliasing=True)
     img = np.clip(img, 0, 1)
 
     # Save probabilty mask: 0-255 grayscale PNG

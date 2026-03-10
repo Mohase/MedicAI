@@ -48,7 +48,7 @@ import numpy as np
 import pandas as pd 
 from torchvision import transforms 
 import data_processing
-import visualization
+import mask_functions as ms
 import config
 
 class PneumothoraxDataset(Dataset):
@@ -79,15 +79,26 @@ class PneumothoraxDataset(Dataset):
         if dicom_path is None: 
             raise FileNotFoundError(f"DICOM file not found for file_id: {row['file_id']}")
 
-        image_array, _ = data_processing.load_dicom_image(dicom_path)
+        try:
+            image_array, _ = data_processing.load_dicom_image(dicom_path)
+        except TimeoutError:
+            print(f"Warning: timeout reading DICOM {dicom_path}, skipping this sample.")
+            new_idx = (idx + 1) % len(self.df)
+            return self.__getitem__(new_idx)
+        except AttributeError as e:
+            # Missing Transfer Syntax UID or other pixel decode failure (e.g. on glass).
+            print(f"Warning: cannot decode pixel data for {dicom_path}: {e}, skipping this sample.")
+            new_idx = (idx + 1) % len(self.df)
+            return self.__getitem__(new_idx)
 
         # 3. Get the rle mask from string
         rle_string = row['EncodedPixels']
         if rle_string == '-1' or pd.isna(rle_string):
-            # No pneumothorax -> create and empty mask 
+            # No pneumothorax -> create an empty mask
             mask = np.zeros(image_array.shape, dtype=np.uint8)
         else:
-            mask = visualization.get_mask_for_image(rle_string, image_array.shape)
+            height, width = image_array.shape
+            mask = ms.rle2mask(rle_string, width, height).T
 
         # 4. Normalize to 0-1 range (convert to float)
         image = image_array.astype(np.float32) / 255.0

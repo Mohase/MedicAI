@@ -1,4 +1,5 @@
 # FDR block
+# FDR module
 # Patch Embedding
 # Transformer encoder
 # Dual decoder
@@ -17,42 +18,97 @@ import math
 
 class FDRBlock(nn.Module):
     """
-    Feature Double Reuse Block
-    - Reuse 1: Dense concatination (DenseNet style) -> concatenates features to reuse info.
-    - Reuse 2: Residual addition   (ResNet style) -> adds input as a skip connection. 
+    Single FDR block with pre-activation bottleneck architecture.
+    Paper: "each FDR block is the pre-activation architecture that
+    sequentially consists of 1×1, 3×3, 1×1 convolution layers and
+    corresponding BN and ReLU layers."
+
+    Produces `growth_rate` output channels.
+    The dense connection (concatenation) and residual addition (Eq. 3)
+    are handled by the enclosing FDRModule.
     """
 
-    def __init__(self, in_channels, out_channels):
+    def __init__(self, in_channels, growth_rate):
         super(FDRBlock, self).__init__()
+        inter_channels = 4 * growth_rate
 
-        # First convolution: processe input
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
-        self.bn1 = nn.BatchNorm2d(out_channels)
+        # Pre-activation: BN → ReLU → Conv (applied in forward)
+        self.bn1 = nn.BatchNorm2d(in_channels)
+        self.conv1 = nn.Conv2d(in_channels, inter_channels, kernel_size=1, bias=False)
 
-        # Second convolution: processes concatenated features
-        # Input channels = out_channels + in_channels (due to concatination)
-        self.conv2 = nn.Conv2d(out_channels + in_channels, out_channels, kernel_size=3, padding=1)
-        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.bn2 = nn.BatchNorm2d(inter_channels)
+        self.conv2 = nn.Conv2d(inter_channels, inter_channels, kernel_size=3, padding=1, bias=False)
 
-        # Skip connection: adjusts channels if input != output channels
-        self.skip = nn.Conv2d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else nn.Identity()
+        self.bn3 = nn.BatchNorm2d(inter_channels)
+        self.conv3 = nn.Conv2d(inter_channels, growth_rate, kernel_size=1, bias=False)
 
     def forward(self, x):
-        identity = x # Save for residual connection
+        out = self.conv1(F.relu(self.bn1(x)))
+        out = self.conv2(F.relu(self.bn2(out)))
+        out = self.conv3(F.relu(self.bn3(out)))
+        return out
 
-        # First conv block 
-        out = F.relu(self.bn1(self.conv1(x)))
 
-        # Dense connection: concatenate input with conv output
-        out = torch.cat([x, out], dim=1) # Reuse #1
+# =============================
+# 1b. FDR MODULE (wraps multiple FDR blocks)
+# =============================
 
-        # Second conv block
-        out = F.relu(self.bn2(self.conv2(out)))
+class FDRModule(nn.Module):
+    """
+    One FDR module = multiple FDR blocks with dense + residual connections.
 
-        # Residual connection: add original input 
-        out = out + self.skip(identity) # Reuse #2
+    Paper Eq. (3): XL = HL([X0, X1, ..., Xl-1]) + XL-1
+    - Dense connection  (Reuse #1): each block receives the concatenation
+      of all previous feature maps [X0, X1, ..., XL-1] as input.
+    - Residual connection (Reuse #2): each block's output is added to
+      the previous block's output (XL-1).
 
-        return out 
+    A transition layer (BN → ReLU → 1×1 conv) compresses the final
+    concatenated features to `out_channels`.
+
+    Args:
+        in_channels:  channels entering this module (X0)
+        out_channels: channels leaving this module (after transition)
+        growth_rate:  channels produced by each FDR block
+        num_blocks:   number of FDR blocks in this module
+    """
+
+    def __init__(self, in_channels, out_channels, growth_rate, num_blocks):
+        super(FDRModule, self).__init__()
+        self.blocks = nn.ModuleList()
+        self.residual_projs = nn.ModuleList()
+
+        concat_ch = in_channels
+        res_ch = in_channels          # first block's residual is X0
+
+        for _ in range(num_blocks):
+            self.blocks.append(FDRBlock(concat_ch, growth_rate))
+            # Project XL-1 to growth_rate channels if dimensions differ
+            if res_ch != growth_rate:
+                self.residual_projs.append(
+                    nn.Conv2d(res_ch, growth_rate, kernel_size=1, bias=False)
+                )
+            else:
+                self.residual_projs.append(nn.Identity())
+            concat_ch += growth_rate  # dense concat grows channel count
+            res_ch = growth_rate      # subsequent residuals are growth_rate
+
+        self.transition = nn.Sequential(
+            nn.BatchNorm2d(concat_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(concat_ch, out_channels, kernel_size=1, bias=False),
+        )
+
+    def forward(self, x):
+        features = [x]
+        prev = x
+        for block, res_proj in zip(self.blocks, self.residual_projs):
+            dense_in = torch.cat(features, dim=1)         # [X0, ..., XL-1]
+            out = block(dense_in) + res_proj(prev)         # Eq. (3)
+            features.append(out)
+            prev = out
+        return self.transition(torch.cat(features, dim=1))
+
 
 # =============================
 # 2. PATCH EMBEDDING
@@ -66,15 +122,15 @@ class PatchEmbedding(nn.Module):
     - Adds positional embeddings
     """
 
-    def __init__(self, in_channels,embed_dim, patch_size, num_patches):
+    def __init__(self, in_channels, embed_dim, patch_size, num_patches):
         super(PatchEmbedding, self).__init__()
 
         # Project patches to embedding dimensions using a conv layer
         # Conv with kernel_size=patch_size and stride=patch_size as patch extraction
         self.projection = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
 
-        # Learnable positional embeddings (one for each patch)
-        self.positional_embeddings = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
+        # Paper Eq. (4): Epos ∈ R^(N+1)×D — covers class token + all patches
+        self.positional_embeddings = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
 
         # Class token: a learnable token prepended to the sequence
         self.class_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
@@ -92,8 +148,8 @@ class PatchEmbedding(nn.Module):
         class_tokens = self.class_token.expand(batch_size, -1, -1)
         x = torch.cat([class_tokens, x], dim=1) # (B, num_patches + 1, embed_dim)
 
-        # Add positional embeddings (excluding class token position)
-        x[:, 1:, :] = x[:, 1:, :] + self.positional_embeddings
+        # Add positional embeddings to ALL tokens including class token (Eq. 4)
+        x = x + self.positional_embeddings
 
         return x
 
@@ -263,9 +319,10 @@ class FDRTransUNet(nn.Module):
         self,
         in_channels=1,
         encoder_channels=(32, 64, 128, 256),
-        embed_dim=256,
-        num_heads=8,
-        num_layers=6,
+        embed_dim=768,
+        growth_rate=64,
+        num_heads=12,
+        num_layers=12,
         patch_size=1,
         mlp_ratio=4.0,
         dropout=0.1,
@@ -285,19 +342,25 @@ class FDRTransUNet(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        # Encoder: FDR stages + downsample -> 128 -> 64 -> 32 -> 16
+        # Encoder: 4 FDR modules (3 with downsampling + 1 bottleneck)
+        # Paper: "Our encoder consists of four FDR modules"
+        # "the larger growth rate has fewer FDR block depths"
         self.encoder_stages = nn.ModuleList()
         self.downsample = nn.ModuleList()
         ch = encoder_channels[0]
         for out_ch in encoder_channels[1:]:
-            self.encoder_stages.append(FDRBlock(ch, out_ch))
+            num_blocks = max(2, out_ch // growth_rate)
+            self.encoder_stages.append(FDRModule(ch, out_ch, growth_rate, num_blocks))
             self.downsample.append(nn.Sequential(
                 nn.Conv2d(out_ch, out_ch, 3, stride=2, padding=1),
                 nn.BatchNorm2d(out_ch),
                 nn.ReLU(inplace=True),
             ))
             ch = out_ch
-        self.encoder_stages.append(FDRBlock(ch,ch))
+
+        # 4th FDR module (bottleneck, no downsampling after)
+        num_blocks = max(2, ch // growth_rate)
+        self.encoder_stages.append(FDRModule(ch, ch, growth_rate, num_blocks))
         self.bottleneck_channels = ch
 
         self.patch_grid_h = input_h // 16
@@ -307,8 +370,12 @@ class FDRTransUNet(nn.Module):
         self.patch_embed = PatchEmbedding(self.bottleneck_channels, embed_dim, patch_size, num_patches)
         self.transformer = TransformerEncoder(embed_dim, num_heads, num_layers, mlp_ratio, dropout)
 
-        skip_ch = [encoder_channels[-1], encoder_channels[-2], encoder_channels[-3], encoder_channels[-4]]
+        # Skip channels from 4 FDR modules (reversed: bottleneck first, stem-adjacent last)
+        # Modules output: encoder_channels[1], encoder_channels[2], ..., encoder_channels[-1], encoder_channels[-1]
+        module_out_ch = list(encoder_channels[1:]) + [encoder_channels[-1]]
+        skip_ch = list(reversed(module_out_ch))
         decode_ch = [256, 128, 64, 32]
+
         self.decoder = DualDecoder(
             embed_dim=embed_dim,
             skip_channels=skip_ch,
@@ -322,18 +389,18 @@ class FDRTransUNet(nn.Module):
     def _encoder_forward(self, x):
         skips = []
         x = self.stem(x)
-        skips.append(x)
         for stage, down in zip(self.encoder_stages[:-1], self.downsample):
             x = stage(x)
             skips.append(x)
             x = down(x)
         x = self.encoder_stages[-1](x)
+        skips.append(x)  # 4th skip from bottleneck FDR module
         return x, skips
     
 
     def forward(self, x):
         enc_out, skips = self._encoder_forward(x)
-        encoder_skips = [skips[-1], skips[-2], skips[-3], skips[-4]]
+        encoder_skips = list(reversed(skips))  # [16×16, 32×32, 64×64, 128×128]
 
         patches = self.patch_embed(enc_out)
         tokens = self.transformer(patches)
@@ -344,4 +411,3 @@ class FDRTransUNet(nn.Module):
         combined = (logits_a + logits_b) / 2.0
 
         return combined, logits_a, logits_b
-        
