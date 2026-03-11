@@ -81,10 +81,9 @@ EARLY_STOP_PATIENCE = 11
 # After sigmoid, pixels >= 0.5 are predicted as pneumothorax-
 PIXEL_TRESHOLD = 0.5
 
-# Gradient clipping: not in paper, but standard for transformer models. 
-# Prevents exploding gradients in attention layers.
-# 1.0 is the most common value (used in ViT, BERT, GPT).
-GRAD_CLIP_MAX_NORM = 1.0
+# Gradient clipping: disabled. Normalization layers (LayerNorm, etc.) already keep gradients
+# in check; clipping was likely over-limiting updates and contributing to early plateau.
+GRAD_CLIP_MAX_NORM = None  # set to a float (e.g. 1.0) to re-enable
 
 # Checkpoint saving: best model by validation mIoU (for inference/predict.py)
 CHECKPOINT_DIR = os.path.join(script_dir, "checkpoints")
@@ -244,9 +243,8 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
         # Compute gradients
         loss.backward()
 
-        #  Clip gradients to prevent explosion (standard for transformers)
-        # NOT IN PAPER
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP_MAX_NORM)
+        if GRAD_CLIP_MAX_NORM is not None:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP_MAX_NORM)
 
         # Update weights
         optimizer.step()

@@ -2,10 +2,11 @@
 Predict pneumothorax segmentation from a single image.
 Saves probabilty mask, binary mask, overlay image, and scores.
 
-Usage: 
-    python3 Code/predict.py path/to/image.dcm
-    python3 Code/predict.py path/to/image.png
-    (optional) python Code/predict.py path/to/image.dcm outputs/subdir
+Usage:
+    python Code/predict.py path/to/image.dcm
+    python Code/predict.py path/to/image.dcm outputs/subdir
+    python Code/predict.py --random              # pick one random image from the dataset
+    python Code/predict.py --random --with-pneumo   # prefer an image with pneumothorax
 
 From code: 
     from predict import load_model, predict_from_path, save_overlay_and_mask
@@ -14,9 +15,11 @@ From code:
     save_overlay_and_mask("path/to/image.dcm", out, save_dir="outputs") 
 """
 
+import argparse
 import os
 import sys
 import numpy as np
+import pandas as pd
 import torch
 
 # Path setup: so we can run as "python Code/predict.py" from project root (Code)
@@ -249,12 +252,34 @@ def save_overlay_and_mask(image_path_or_array, result, save_dir=None, base_name=
 
 
 def main():
-    # Filename: from CLI or default. Output dir: optional second argument.
-    filename = sys.argv[1] if len(sys.argv) >= 2 else DEFAULT_TEST_IMAGE
-    save_dir = sys.argv[2] if len(sys.argv) >= 3 else DEFAULT_SAVE_DIR  
+    parser = argparse.ArgumentParser(description="Predict pneumothorax segmentation from an image")
+    parser.add_argument("path", nargs="?", default=None, help="Path to DICOM or image (optional if --random)")
+    parser.add_argument("save_dir", nargs="?", default=None, help="Output directory (optional)")
+    parser.add_argument("--random", action="store_true", help="Pick one random image from the dataset")
+    parser.add_argument("--with-pneumo", action="store_true", help="With --random, prefer an image that has pneumothorax")
+    args = parser.parse_args()
 
-    # Full path = test images folder + filename
-    path = os.path.join(TEST_IMAGES_DIR, filename)
+    save_dir = args.save_dir if args.save_dir is not None else DEFAULT_SAVE_DIR
+
+    if args.random:
+        data_processing._build_dicom_path_cache(config.image_dir)
+        df = data_processing.load_data()
+        if args.with_pneumo:
+            has_pneumo = (df["EncodedPixels"] != "-1") & df["EncodedPixels"].notna()
+            if has_pneumo.any():
+                df = df[has_pneumo]
+        row = df.sample(n=1).iloc[0]
+        file_id = row["file_id"]
+        path = data_processing.find_dicom_file(file_id, config.image_dir)
+        if path is None:
+            print(f"No DICOM found for file_id={file_id}")
+            sys.exit(1)
+        print(f"Random image: file_id={file_id}, GT pneumothorax={row['EncodedPixels'] != '-1' and pd.notna(row.get('EncodedPixels'))}")
+    else:
+        path = args.path if args.path is not None else os.path.join(TEST_IMAGES_DIR, DEFAULT_TEST_IMAGE)
+    if not os.path.exists(path):
+        print(f"File not found: {path}")
+        sys.exit(1)
 
     print(f"Loading model from {BEST_MODEL_PATH}...")
     model = load_model()
@@ -263,7 +288,10 @@ def main():
     print(f"Has pneumothorax:   {out['has_pneumothorax']}")
     print(f"Confidence:         {out['confidence']:.4f}")
     print(f"Fraction positive:  {out['fraction_positive']:.4f}")
-    save_overlay_and_mask(path, out, save_dir=save_dir)
+    base_name = None
+    if args.random:
+        base_name = "random_" + os.path.basename(path).replace(".dcm", "")[:24]
+    save_overlay_and_mask(path, out, save_dir=save_dir, base_name=base_name)
     return out
 
 
