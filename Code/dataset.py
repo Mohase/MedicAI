@@ -91,14 +91,25 @@ class PneumothoraxDataset(Dataset):
             new_idx = (idx + 1) % len(self.df)
             return self.__getitem__(new_idx)
 
-        # 3. Get the rle mask from string
-        rle_string = row['EncodedPixels']
-        if rle_string == '-1' or pd.isna(rle_string):
-            # No pneumothorax -> create an empty mask
-            mask = np.zeros(image_array.shape, dtype=np.uint8)
+        # 3. Build mask from RLE (single EncodedPixels or merged EncodedPixels_list)
+        height, width = image_array.shape
+        if "EncodedPixels_list" in row and isinstance(row["EncodedPixels_list"], (list, np.ndarray)):
+            rle_list = row["EncodedPixels_list"]
+            if len(rle_list) == 0:
+                mask = np.zeros((height, width), dtype=np.uint8)
+            else:
+                mask = np.zeros((height, width), dtype=np.uint8)
+                for rle_string in rle_list:
+                    if rle_string == "-1" or pd.isna(rle_string) or not str(rle_string).strip():
+                        continue
+                    part = ms.rle2mask(str(rle_string), width, height).T  # (H, W)
+                    mask = np.maximum(mask, part)
         else:
-            height, width = image_array.shape
-            mask = ms.rle2mask(rle_string, width, height).T
+            rle_string = row["EncodedPixels"]
+            if rle_string == "-1" or pd.isna(rle_string):
+                mask = np.zeros((height, width), dtype=np.uint8)
+            else:
+                mask = ms.rle2mask(rle_string, width, height).T
 
         # 4. Normalize to 0-1 range (convert to float)
         image = image_array.astype(np.float32) / 255.0

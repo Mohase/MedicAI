@@ -76,7 +76,7 @@ EARLY_STOP_PATIENCE = 80
 
 # Pixel threshold: paper specifies 0.5.
 # After sigmoid, pixels >= 0.5 are predicted as pneumothorax-
-PIXEL_TRESHOLD = 0.5
+PIXEL_TRESHOLD = 0.4
 
 # Loss: hybrid BCE + Dice (helps with class imbalance and recall).
 BCE_WEIGHT = 0.5
@@ -348,16 +348,19 @@ def main():
         data_processing.save_processed_data(df)
 
     
-    # 3. Split the data: train(60%), val(20%), test(20%)
+    # 3. Merge multiple RLE rows per image into one row per image (union of masks)
+    df = data_processing.merge_rle_rows(df, group_by="file_id")
+
+    # 4. Split the data: train(60%), val(20%), test(20%)
     # Train = fit model.
     # Val   = early stopping + model selection.
-    # Test  = final eval only. 
+    # Test  = final eval only.
 
     train_df, val_df, test_df = create_train_val_test_split(
         df, train_ratio=0.6, val_ratio=0.2, test_ratio=0.2
     )
 
-    # 4. Dataset: train gets augmentation; val and test don't - for fair evalutaion
+    # 5. Dataset: train gets augmentation; val and test don't - for fair evaluation
     data_processing._build_dicom_path_cache(config.image_dir)
 
     train_ds = PneumothoraxDataset(
@@ -376,7 +379,7 @@ def main():
         target_size=TARGET_SIZE, transform=None
     )
 
-    # 5. Dataloader: batch the data; shuffle only training set
+    # 6. Dataloader: batch the data; shuffle only training set
     train_loader = DataLoader(
         train_ds, batch_size=BATCH_SIZE, shuffle=True,
         num_workers=4, pin_memory=True, persistent_workers=True

@@ -85,6 +85,35 @@ def add_file_id_column(df, dicom_id_mapping=None, image_directory=None):
 
     return df
 
+def merge_rle_rows(df, group_by="file_id"):
+    """
+    Merge multiple CSV rows per image into one row per image.
+    SIIM can have several EncodedPixels per ImageId (e.g. one per lung).
+    Returns a DataFrame with one row per image and column EncodedPixels_list
+    (list of RLE strings for that image, excluding -1/empty). Use this df for
+    training so each image is trained once with the union of all RLE masks.
+    """
+    if group_by not in df.columns:
+        raise ValueError(f"merge_rle_rows: column '{group_by}' not in df")
+    id_col = "ImageId" if group_by == "file_id" else "file_id"
+    if id_col in df.columns:
+        first_id = df.groupby(group_by)[id_col].first().reset_index()
+    rows = []
+    for key, group in df.groupby(group_by):
+        rles = group["EncodedPixels"].dropna().astype(str).tolist()
+        rles = [r for r in rles if r != "-1" and r.strip()]
+        other = {group_by: key}
+        if id_col in df.columns:
+            other[id_col] = group[id_col].iloc[0]
+        other["EncodedPixels_list"] = rles
+        rows.append(other)
+    merged = pd.DataFrame(rows)
+    n_before = len(df)
+    n_after = len(merged)
+    print(f"Merged RLE rows: {n_before} -> {n_after} (one row per image, {n_before - n_after} duplicate rows removed)")
+    return merged
+
+
 def save_processed_data(df, csv_path=None, parquet_path=None):
     """Save processed DataFrame to CSV and Parquet"""
     if csv_path is None:
