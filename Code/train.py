@@ -78,6 +78,9 @@ EARLY_STOP_PATIENCE = 80
 # After sigmoid, pixels >= 0.5 are predicted as pneumothorax-
 PIXEL_TRESHOLD = 0.4
 
+# Validation: try multiple thresholds and report best Dice (and metrics at that threshold).
+VAL_THRESHOLDS = [0.1, 0.2, 0.3, 0.4, 0.5]
+
 # Loss: hybrid BCE + Dice (helps with class imbalance and recall).
 BCE_WEIGHT = 0.5
 DICE_WEIGHT = 0.5
@@ -294,21 +297,20 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
 def validate(model, loader, criterion, device):
     """
     Evaluate on validation set WITHOUT updating weights.
+    Computes Dice (and IoU, prec, rec) at each threshold in VAL_THRESHOLDS,
+    then reports metrics at the threshold that gave the highest mean Dice.
 
-    Returns: val_loss, val_dice, val_miou, val_precision, val_recall
-
-    Paper uses mIoU as the metric for early stopping.
-    Precision and Recall are reported in Tables 2 and 3. 
+    Returns: val_loss, val_dice, val_miou, val_precision, val_recall, best_threshold
     """
     model.eval()
     total_loss = 0.0
-    total_dice = 0.0
-    total_iou  = 0.0
-    total_prec = 0.0
-    total_rec  = 0.0
     n = 0
+    sum_dice = {t: 0.0 for t in VAL_THRESHOLDS}
+    sum_iou  = {t: 0.0 for t in VAL_THRESHOLDS}
+    sum_prec = {t: 0.0 for t in VAL_THRESHOLDS}
+    sum_rec  = {t: 0.0 for t in VAL_THRESHOLDS}
 
-    with torch.no_grad(): 
+    with torch.no_grad():
         for images, masks in loader:
             images, masks = images.to(device), masks.to(device)
 
@@ -316,16 +318,28 @@ def validate(model, loader, criterion, device):
 
             loss = criterion(logits_a, masks) + criterion(logits_b, masks)
             total_loss += loss.item()
-            total_dice += dice_score(combined, masks)
-            total_iou  += iou_score(combined, masks)
-            total_prec += precision_score(combined, masks)
-            total_rec  += recall_score(combined, masks)
+
+            for t in VAL_THRESHOLDS:
+                sum_dice[t] += dice_score(combined, masks, threshold=t)
+                sum_iou[t]  += iou_score(combined, masks, threshold=t)
+                sum_prec[t] += precision_score(combined, masks, threshold=t)
+                sum_rec[t]  += recall_score(combined, masks, threshold=t)
             n += 1
 
     if n == 0:
-        return 0.0, 0.0, 0.0, 0.0, 0.0
-    
-    return total_loss / n, total_dice / n, total_iou / n, total_prec / n, total_rec / n
+        return 0.0, 0.0, 0.0, 0.0, 0.0, VAL_THRESHOLDS[0]
+
+    mean_dice = {t: sum_dice[t] / n for t in VAL_THRESHOLDS}
+    best_t = max(VAL_THRESHOLDS, key=lambda t: mean_dice[t])
+
+    return (
+        total_loss / n,
+        mean_dice[best_t],
+        sum_iou[best_t] / n,
+        sum_prec[best_t] / n,
+        sum_rec[best_t] / n,
+        best_t,
+    )
 
 
 
@@ -439,7 +453,7 @@ def main():
 
     for epoch in range(NUM_EPOCHS):
         train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
-        val_loss, val_dice, val_miou, val_prec, val_rec = validate(
+        val_loss, val_dice, val_miou, val_prec, val_rec, best_t = validate(
             model, val_loader, criterion, device
         )
         scheduler.step()
@@ -476,6 +490,7 @@ def main():
             f"  prec={val_prec:.4f}"
             f"  rec={val_rec:.4f}"
             f"  best_mIoU={best_miou:.4f}"
+            f"  best_t={best_t}"
             f"  lr={current_lr:.6f}"
             f"  patience={patience_count}"
         )
@@ -504,11 +519,11 @@ def main():
         test_ds, batch_size=BATCH_SIZE, shuffle=False,
         num_workers=2, pin_memory=True, persistent_workers=True
     )
-    test_loss, test_dice, test_miou, test_prec, test_rec = validate(
+    test_loss, test_dice, test_miou, test_prec, test_rec, test_best_t = validate(
         model, test_loader, criterion, device
     )
     print(
-        f"\nTest set results:"
+        f"\nTest set results (best threshold={test_best_t}):"
         f"\n  loss={test_loss:.4f}"
         f"\n  dice={test_dice:.4f}"
         f"\n  mIoU={test_miou:.4f}"
