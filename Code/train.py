@@ -76,14 +76,16 @@ EARLY_STOP_PATIENCE = 80
 
 # Pixel threshold: paper specifies 0.5.
 # After sigmoid, pixels >= 0.5 are predicted as pneumothorax-
-PIXEL_TRESHOLD = 0.4
+PIXEL_TRESHOLD = 0.1
 
 # Validation: try multiple thresholds and report best Dice (and metrics at that threshold).
 VAL_THRESHOLDS = [0.1, 0.2, 0.3, 0.4, 0.5]
 
 # Loss: hybrid BCE + Dice (helps with class imbalance and recall).
-BCE_WEIGHT = 0.5
-DICE_WEIGHT = 0.5
+# Stronger push on positives (pos_weight, Dice weight) to raise probabilities and break 0.78 plateau.
+BCE_WEIGHT = 0.35
+DICE_WEIGHT = 0.65
+POS_WEIGHT = 15.0
 
 # Gradient clipping: disabled. Normalization layers (LayerNorm, etc.) already keep gradients
 # in check; clipping was likely over-limiting updates and contributing to early plateau.
@@ -422,7 +424,7 @@ def main():
 
 
     # 7. Loss (BCE+Dice with pos_weight), optimizer (AdamW), scheduler (cosine warm restarts)
-    criterion = HybridLoss(bce_weight=BCE_WEIGHT, dice_weight=DICE_WEIGHT).to(device)
+    criterion = HybridLoss(bce_weight=BCE_WEIGHT, dice_weight=DICE_WEIGHT, pos_weight=POS_WEIGHT).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer, T_0=T_0, T_mult=T_mult
@@ -441,7 +443,7 @@ def main():
     best_miou = 0.0
     patience_count = 0
     print(f"\nTraining up to {NUM_EPOCHS} epochs (batch_size={BATCH_SIZE}, lr={LR})")
-    print(f"Loss: BCE ({BCE_WEIGHT}, pos_weight=5.0) + Dice ({DICE_WEIGHT}). Cosine warm restarts (T_0={T_0}, T_mult={T_mult}). AdamW. Grad clip={GRAD_CLIP_MAX_NORM}")
+    print(f"Loss: BCE ({BCE_WEIGHT}, pos_weight={POS_WEIGHT}) + Dice ({DICE_WEIGHT}). Cosine warm restarts (T_0={T_0}, T_mult={T_mult}). AdamW. Grad clip={GRAD_CLIP_MAX_NORM}")
     print(f"Early stop if no mIoU improvements for {EARLY_STOP_PATIENCE} epochs\n")
 
     # --- History for training curves (convergence + metrics) ---
