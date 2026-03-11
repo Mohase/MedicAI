@@ -66,10 +66,9 @@ WEIGHT_DECAY = 0.01
 # Validation split: 20% for validation. Specified ratio in paper (6:2:2 ; Train, val, test)
 VAL_RATIO = 0.2
 
-# Cosine annealing warm restarts: paper specifies T_0=8, T_mult=2
-# LR starts at 3e-4, decays to ~0 over 8 epochs, then restarts.
-# After first restart, cycle length doubles to 16, then 32, etc.
-# Will help escape local minima and find better solutions.
+# Constant LR for first N epochs, then cosine annealing warm restarts.
+CONSTANT_LR_EPOCHS = 10
+# Cosine: T_0=8, T_mult=2 (first cycle 8 epochs, then 16, 32, ...)
 T_0 = 8
 T_mult = 2 
 
@@ -80,6 +79,10 @@ EARLY_STOP_PATIENCE = 11
 # Pixel threshold: paper specifies 0.5.
 # After sigmoid, pixels >= 0.5 are predicted as pneumothorax-
 PIXEL_TRESHOLD = 0.5
+
+# Loss: hybrid BCE + Dice (helps with class imbalance and recall).
+BCE_WEIGHT = 0.5
+DICE_WEIGHT = 0.5
 
 # Gradient clipping: disabled. Normalization layers (LayerNorm, etc.) already keep gradients
 # in check; clipping was likely over-limiting updates and contributing to early plateau.
@@ -110,6 +113,36 @@ train_transform = transforms.Compose([
     transforms.Normalize(mean=[0.5, 0.0], std=[0.5, 1.0]),
 
 ])
+
+# =============================
+# Loss: Dice + hybrid
+# =============================
+
+def dice_loss(pred_logits, targets, smooth=1.0):
+    """Differentiable soft Dice loss. 1 - Dice; encourages overlap with target."""
+    probs = torch.sigmoid(pred_logits)
+    probs = probs.view(-1)
+    targets = targets.view(-1)
+    intersection = (probs * targets).sum()
+    union = probs.sum() + targets.sum()
+    dice = (2.0 * intersection + smooth) / (union + smooth)
+    return 1.0 - dice
+
+
+class HybridLoss(torch.nn.Module):
+    """BCE + Dice. Weights sum to 1 (BCE_WEIGHT + DICE_WEIGHT)."""
+    def __init__(self, bce_weight=0.5, dice_weight=0.5):
+        super().__init__()
+        self.bce_weight = bce_weight
+        self.dice_weight = dice_weight
+        self.bce = torch.nn.BCEWithLogitsLoss()
+
+    def forward(self, logits, targets):
+        return (
+            self.bce_weight * self.bce(logits, targets)
+            + self.dice_weight * dice_loss(logits, targets)
+        )
+
 
 # =============================
 # Metrics
@@ -371,11 +404,17 @@ def main():
     print(f"Model parameters: {n:,}\nModel parameters (Million): {n/1e6:.2f}")
 
 
-    # 7. Loss, optimizer, scheduler (paper: BCEwithlogitsloss, Adam 3e-4, cosine warm restarts)
-    criterion = torch.nn.BCEWithLogitsLoss()
+    # 7. Loss (BCE + Dice), optimizer, scheduler (constant LR for 10 epochs, then cosine warm restarts)
+    criterion = HybridLoss(bce_weight=BCE_WEIGHT, dice_weight=DICE_WEIGHT)
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+    constant_scheduler = torch.optim.lr_scheduler.ConstantLR(
+        optimizer, factor=1.0, total_iters=CONSTANT_LR_EPOCHS
+    )
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer, T_0=T_0, T_mult=T_mult
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer, [constant_scheduler, cosine_scheduler], milestones=[CONSTANT_LR_EPOCHS]
     )
 
     # 8. Sanity check: one forward pass to catch shape errors before training
@@ -391,6 +430,7 @@ def main():
     best_miou = 0.0
     patience_count = 0
     print(f"\nTraining up to {NUM_EPOCHS} epochs (batch_size={BATCH_SIZE}, lr={LR})")
+    print(f"Loss: BCE ({BCE_WEIGHT}) + Dice ({DICE_WEIGHT}). LR: constant for {CONSTANT_LR_EPOCHS} epochs, then cosine warm restarts (T_0={T_0}, T_mult={T_mult}).")
     print(f"Early stop if no mIoU improvements for {EARLY_STOP_PATIENCE} epochs\n")
 
     # --- History for training curves (convergence + metrics) ---
