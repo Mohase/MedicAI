@@ -35,7 +35,7 @@ def get_all_dcm_files(image_directory=None):
     dcm_files = []
     for root, _, files in os.walk(image_directory):
         for file in files:
-            if file.endswith('.dcm'):
+            if file.endswith('.dcm') and not file.startswith('._'):
                 dcm_files.append(os.path.join(root, file))
     return dcm_files
 
@@ -115,7 +115,7 @@ def find_dicom_file(file_id, image_directory=None):
     
     for root, _, files in os.walk(image_directory):
         for file in files:
-            if file.endswith('.dcm'):
+            if file.endswith('.dcm') and not file.startswith('._'):
                 filepath = os.path.join(root, file)
                 if file_id in filepath or os.path.basename(filepath).replace('.dcm', '') == file_id:
                     return filepath
