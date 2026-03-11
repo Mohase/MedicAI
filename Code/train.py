@@ -50,7 +50,7 @@ from plot_curves import plot_training_curves
 TARGET_SIZE = (256, 256)
 
 # Batch size: paper specifies 4. 
-BATCH_SIZE = 16
+BATCH_SIZE = 6
 
 # Max epochs: Not specified in paper. Cap can be high because early stopping will halt training. 
 # -> With patience=11, 100 will be a plenty.
