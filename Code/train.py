@@ -85,7 +85,7 @@ VAL_THRESHOLDS = [0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5]
 # Stronger push on positives (pos_weight, Dice weight) to raise probabilities and break 0.78 plateau.
 BCE_WEIGHT = 0.10
 DICE_WEIGHT = 0.85
-POS_WEIGHT = 50.0
+POS_WEIGHT = 100.0
 
 # Gradient clipping: disabled. Normalization layers (LayerNorm, etc.) already keep gradients
 # in check; clipping was likely over-limiting updates and contributing to early plateau.
@@ -319,6 +319,10 @@ def validate(model, loader, criterion, device):
             images, masks = images.to(device), masks.to(device)
 
             combined, logits_a, logits_b = model(images)
+            avg_prob = torch.sigmoid(combined).mean().item()
+            max_prob = torch.sigmoid(combined).max().item()
+            pos_img_ratio = (masks.sum(dim=(1, 2, 3)) > 0).float().mean().item()
+            print(f"  Avg sigmoid = {avg_prob:.5f} | Max sigmoid = {max_prob:.5f} | % positive images in batch = {pos_img_ratio:.3f}")
 
             loss = criterion(logits_a, masks) + criterion(logits_b, masks)
             total_loss += loss.item()
