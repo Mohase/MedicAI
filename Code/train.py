@@ -319,10 +319,6 @@ def validate(model, loader, criterion, device):
             images, masks = images.to(device), masks.to(device)
 
             combined, logits_a, logits_b = model(images)
-            avg_prob = torch.sigmoid(combined).mean().item()
-            max_prob = torch.sigmoid(combined).max().item()
-            pos_img_ratio = (masks.sum(dim=(1, 2, 3)) > 0).float().mean().item()
-            print(f"  Avg sigmoid = {avg_prob:.5f} | Max sigmoid = {max_prob:.5f} | % positive images in batch = {pos_img_ratio:.3f}")
 
             loss = criterion(logits_a, masks) + criterion(logits_b, masks)
             total_loss += loss.item()
