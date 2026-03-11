@@ -83,8 +83,8 @@ VAL_THRESHOLDS = [0.1, 0.2, 0.3, 0.4, 0.5]
 
 # Loss: hybrid BCE + Dice (helps with class imbalance and recall).
 # Stronger push on positives (pos_weight, Dice weight) to raise probabilities and break 0.78 plateau.
-BCE_WEIGHT = 0.35
-DICE_WEIGHT = 0.65
+BCE_WEIGHT = 0.30
+DICE_WEIGHT = 0.75
 POS_WEIGHT = 15.0
 
 # Gradient clipping: disabled. Normalization layers (LayerNorm, etc.) already keep gradients
