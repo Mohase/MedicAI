@@ -79,13 +79,13 @@ EARLY_STOP_PATIENCE = 80
 PIXEL_TRESHOLD = 0.1
 
 # Validation: try multiple thresholds and report best Dice (and metrics at that threshold).
-VAL_THRESHOLDS = [0.1, 0.2, 0.3, 0.4, 0.5]
+VAL_THRESHOLDS = [0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5]
 
 # Loss: hybrid BCE + Dice (helps with class imbalance and recall).
 # Stronger push on positives (pos_weight, Dice weight) to raise probabilities and break 0.78 plateau.
-BCE_WEIGHT = 0.30
-DICE_WEIGHT = 0.75
-POS_WEIGHT = 15.0
+BCE_WEIGHT = 0.10
+DICE_WEIGHT = 0.85
+POS_WEIGHT = 50.0
 
 # Gradient clipping: disabled. Normalization layers (LayerNorm, etc.) already keep gradients
 # in check; clipping was likely over-limiting updates and contributing to early plateau.
@@ -311,6 +311,8 @@ def validate(model, loader, criterion, device):
     sum_iou  = {t: 0.0 for t in VAL_THRESHOLDS}
     sum_prec = {t: 0.0 for t in VAL_THRESHOLDS}
     sum_rec  = {t: 0.0 for t in VAL_THRESHOLDS}
+    sum_sigmoid_mean = 0.0
+    max_sigmoid = 0.0
 
     with torch.no_grad():
         for images, masks in loader:
@@ -326,6 +328,9 @@ def validate(model, loader, criterion, device):
                 sum_iou[t]  += iou_score(combined, masks, threshold=t)
                 sum_prec[t] += precision_score(combined, masks, threshold=t)
                 sum_rec[t]  += recall_score(combined, masks, threshold=t)
+            probs = torch.sigmoid(combined)
+            sum_sigmoid_mean += probs.mean().item()
+            max_sigmoid = max(max_sigmoid, probs.max().item())
             n += 1
 
     if n == 0:
@@ -333,6 +338,8 @@ def validate(model, loader, criterion, device):
 
     mean_dice = {t: sum_dice[t] / n for t in VAL_THRESHOLDS}
     best_t = max(VAL_THRESHOLDS, key=lambda t: mean_dice[t])
+    avg_prob = sum_sigmoid_mean / n
+    print(f"  Avg sigmoid = {avg_prob:.5f} | Max sigmoid = {max_sigmoid:.5f}")
 
     return (
         total_loss / n,

@@ -275,6 +275,10 @@ class DualDecoder(nn.Module):
 
         self.head_a = nn.Conv2d(decode_channels[-1], 1, 1)
         self.head_b = nn.Conv2d(decode_channels[-1], 1, 1)
+        # Bias trick: start with ~0.12 probability instead of ~0.5 (sigmoid(-2) ≈ 0.12)
+        with torch.no_grad():
+            self.head_a.bias.fill_(-2.0)
+            self.head_b.bias.fill_(-2.0)
 
     def _upsample_and_concat(self, x, skip, block, shortcut):
         """ Upsample, concat with skip, double conv, then add residual as per paper. """
