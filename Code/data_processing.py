@@ -108,17 +108,34 @@ def save_processed_data(df, csv_path=None, parquet_path=None):
         print(f"Could not save Parquet file: {e}")
     
 
-def find_dicom_file(file_id, image_directory=None):
-    """Find DICOM file path by file_id"""
+_dicom_path_cache = None
+
+def _build_dicom_path_cache(image_directory=None):
+    """Walk the DICOM tree once and build file_id -> path dict."""
+    global _dicom_path_cache
     if image_directory is None:
         image_directory = config.image_dir
-    
+    print("Building DICOM path cache...")
+    _dicom_path_cache = {}
     for root, _, files in os.walk(image_directory):
         for file in files:
             if file.endswith('.dcm') and not file.startswith('._'):
                 filepath = os.path.join(root, file)
-                if file_id in filepath or os.path.basename(filepath).replace('.dcm', '') == file_id:
-                    return filepath
+                file_id = file.replace('.dcm', '')
+                _dicom_path_cache[file_id] = filepath
+    print(f"Cached {len(_dicom_path_cache)} DICOM paths")
+    return _dicom_path_cache
+
+def find_dicom_file(file_id, image_directory=None):
+    """Find DICOM file path by file_id. Uses cache for O(1) lookup."""
+    global _dicom_path_cache
+    if _dicom_path_cache is None:
+        _build_dicom_path_cache(image_directory)
+    if file_id in _dicom_path_cache:
+        return _dicom_path_cache[file_id]
+    for fid, path in _dicom_path_cache.items():
+        if file_id in path:
+            return path
     return None
 
 def load_dicom_image(file_path):

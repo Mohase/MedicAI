@@ -50,7 +50,7 @@ from plot_curves import plot_training_curves
 TARGET_SIZE = (256, 256)
 
 # Batch size: paper specifies 4. 
-BATCH_SIZE = 4
+BATCH_SIZE = 16
 
 # Max epochs: Not specified in paper. Cap can be high because early stopping will halt training. 
 # -> With patience=11, 100 will be a plenty.
@@ -327,6 +327,8 @@ def main():
     )
 
     # 4. Dataset: train gets augmentation; val and test don't - for fair evalutaion
+    data_processing._build_dicom_path_cache(config.image_dir)
+
     train_ds = PneumothoraxDataset(
         train_df, image_dir=config.image_dir,
         target_size=TARGET_SIZE, transform=train_transform
@@ -346,11 +348,12 @@ def main():
     # 5. Dataloader: batch the data; shuffle only training set
     train_loader = DataLoader(
         train_ds, batch_size=BATCH_SIZE, shuffle=True,
-        num_workers=0, pin_memory=(device.type == "cuda")
+        num_workers=4, pin_memory=True, persistent_workers=True
     )
 
     val_loader = DataLoader(
-        val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0
+        val_ds, batch_size=BATCH_SIZE, shuffle=False,
+        num_workers=2, pin_memory=True, persistent_workers=True
     )
 
     # 6. Model: FDR-TransUNet, same input size as TARGET_SIZE
@@ -462,7 +465,10 @@ def main():
 
     # 10. Final evalutaion on held_out test set
     # Test set was never used for training or early stopping
-    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+    test_loader = DataLoader(
+        test_ds, batch_size=BATCH_SIZE, shuffle=False,
+        num_workers=2, pin_memory=True, persistent_workers=True
+    )
     test_loss, test_dice, test_miou, test_prec, test_rec = validate(
         model, test_loader, criterion, device
     )
