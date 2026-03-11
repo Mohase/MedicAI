@@ -66,15 +66,13 @@ WEIGHT_DECAY = 0.01
 # Validation split: 20% for validation. Specified ratio in paper (6:2:2 ; Train, val, test)
 VAL_RATIO = 0.2
 
-# Constant LR for first N epochs, then cosine annealing warm restarts.
-CONSTANT_LR_EPOCHS = 10
-# Cosine: T_0=8, T_mult=2 (first cycle 8 epochs, then 16, 32, ...)
-T_0 = 8
-T_mult = 2 
+# Cosine annealing warm restarts: T_0=10 (first cycle 10 epochs), T_mult=2
+T_0 = 10
+T_mult = 2
 
 # Early stopping: paper states patience > 10 epochs of no mIoU improvement. 
 # So we stop after 11 consecutive epochs with no improvement. 
-EARLY_STOP_PATIENCE = 11
+EARLY_STOP_PATIENCE = 80
 
 # Pixel threshold: paper specifies 0.5.
 # After sigmoid, pixels >= 0.5 are predicted as pneumothorax-
@@ -86,7 +84,7 @@ DICE_WEIGHT = 0.5
 
 # Gradient clipping: disabled. Normalization layers (LayerNorm, etc.) already keep gradients
 # in check; clipping was likely over-limiting updates and contributing to early plateau.
-GRAD_CLIP_MAX_NORM = None  # set to a float (e.g. 1.0) to re-enable
+GRAD_CLIP_MAX_NORM = 1.0
 
 # Checkpoint saving: best model by validation mIoU (for inference/predict.py)
 CHECKPOINT_DIR = os.path.join(script_dir, "checkpoints")
@@ -108,10 +106,11 @@ BEST_MODEL_PATH = os.path.join(CHECKPOINT_DIR, "best_model.pth")
 # symmetric range works well with ReLU and batch norm.
 
 train_transform = transforms.Compose([
-    transforms.RandomRotation(10), 
-    transforms.RandomHorizontalFlip(0.4),
+    transforms.RandomRotation(10),
+    transforms.RandomHorizontalFlip(0.5),
+    transforms.RandomVerticalFlip(0.1),
+    transforms.RandomAffine(degrees=0, translate=(0.05, 0.05), scale=(0.9, 1.1)),
     transforms.Normalize(mean=[0.5, 0.0], std=[0.5, 1.0]),
-
 ])
 
 # =============================
@@ -119,23 +118,23 @@ train_transform = transforms.Compose([
 # =============================
 
 def dice_loss(pred_logits, targets, smooth=1.0):
-    """Differentiable soft Dice loss. 1 - Dice; encourages overlap with target."""
+    """Differentiable soft Dice loss computed per-image then averaged."""
     probs = torch.sigmoid(pred_logits)
-    probs = probs.view(-1)
-    targets = targets.view(-1)
-    intersection = (probs * targets).sum()
-    union = probs.sum() + targets.sum()
+    intersection = (probs * targets).sum(dim=(1, 2, 3))
+    union = probs.sum(dim=(1, 2, 3)) + targets.sum(dim=(1, 2, 3))
     dice = (2.0 * intersection + smooth) / (union + smooth)
-    return 1.0 - dice
+    return 1.0 - dice.mean()
 
 
 class HybridLoss(torch.nn.Module):
-    """BCE + Dice. Weights sum to 1 (BCE_WEIGHT + DICE_WEIGHT)."""
-    def __init__(self, bce_weight=0.5, dice_weight=0.5):
+    """BCE (with pos_weight for class imbalance) + Dice."""
+    def __init__(self, bce_weight=0.5, dice_weight=0.5, pos_weight=5.0):
         super().__init__()
         self.bce_weight = bce_weight
         self.dice_weight = dice_weight
-        self.bce = torch.nn.BCEWithLogitsLoss()
+        self.bce = torch.nn.BCEWithLogitsLoss(
+            pos_weight=torch.tensor([pos_weight])
+        )
 
     def forward(self, logits, targets):
         return (
@@ -313,9 +312,10 @@ def validate(model, loader, criterion, device):
         for images, masks in loader:
             images, masks = images.to(device), masks.to(device)
 
-            combined, _, _ = model(images)
+            combined, logits_a, logits_b = model(images)
 
-            total_loss += criterion(combined, masks).item()
+            loss = criterion(logits_a, masks) + criterion(logits_b, masks)
+            total_loss += loss.item()
             total_dice += dice_score(combined, masks)
             total_iou  += iou_score(combined, masks)
             total_prec += precision_score(combined, masks)
@@ -404,17 +404,11 @@ def main():
     print(f"Model parameters: {n:,}\nModel parameters (Million): {n/1e6:.2f}")
 
 
-    # 7. Loss (BCE + Dice), optimizer, scheduler (constant LR for 10 epochs, then cosine warm restarts)
-    criterion = HybridLoss(bce_weight=BCE_WEIGHT, dice_weight=DICE_WEIGHT)
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    constant_scheduler = torch.optim.lr_scheduler.ConstantLR(
-        optimizer, factor=1.0, total_iters=CONSTANT_LR_EPOCHS
-    )
-    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+    # 7. Loss (BCE+Dice with pos_weight), optimizer (AdamW), scheduler (cosine warm restarts)
+    criterion = HybridLoss(bce_weight=BCE_WEIGHT, dice_weight=DICE_WEIGHT).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer, T_0=T_0, T_mult=T_mult
-    )
-    scheduler = torch.optim.lr_scheduler.SequentialLR(
-        optimizer, [constant_scheduler, cosine_scheduler], milestones=[CONSTANT_LR_EPOCHS]
     )
 
     # 8. Sanity check: one forward pass to catch shape errors before training
@@ -430,7 +424,7 @@ def main():
     best_miou = 0.0
     patience_count = 0
     print(f"\nTraining up to {NUM_EPOCHS} epochs (batch_size={BATCH_SIZE}, lr={LR})")
-    print(f"Loss: BCE ({BCE_WEIGHT}) + Dice ({DICE_WEIGHT}). LR: constant for {CONSTANT_LR_EPOCHS} epochs, then cosine warm restarts (T_0={T_0}, T_mult={T_mult}).")
+    print(f"Loss: BCE ({BCE_WEIGHT}, pos_weight=5.0) + Dice ({DICE_WEIGHT}). Cosine warm restarts (T_0={T_0}, T_mult={T_mult}). AdamW. Grad clip={GRAD_CLIP_MAX_NORM}")
     print(f"Early stop if no mIoU improvements for {EARLY_STOP_PATIENCE} epochs\n")
 
     # --- History for training curves (convergence + metrics) ---
