@@ -85,7 +85,7 @@ VAL_THRESHOLDS = [0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5]
 # Stronger push on positives (pos_weight, Dice weight) to raise probabilities and break 0.78 plateau.
 BCE_WEIGHT = 0.10
 DICE_WEIGHT = 0.85
-POS_WEIGHT = 100.0
+POS_WEIGHT = 320.0
 
 # Gradient clipping: disabled. Normalization layers (LayerNorm, etc.) already keep gradients
 # in check; clipping was likely over-limiting updates and contributing to early plateau.

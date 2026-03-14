@@ -34,3 +34,4 @@ def visualize_pneumothorax(image_array, mask, image_id=None):
     
     plt.tight_layout()
     plt.show()
+
