@@ -84,9 +84,9 @@ VAL_THRESHOLDS = [0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5]
 
 # Loss: hybrid BCE + Dice (helps with class imbalance and recall).
 # Stronger push on positives (pos_weight, Dice weight) to raise probabilities and break 0.78 plateau.
-BCE_WEIGHT = 0.10
-DICE_WEIGHT = 0.85
-POS_WEIGHT = 320.0 # This is weight error. This is determined from -> neg_pixels / pos_pixels
+BCE_WEIGHT = 0.45
+DICE_WEIGHT = 0.55
+POS_WEIGHT = 60.0 # This is weight error. This is determined from -> neg_pixels / pos_pixels (=330)
 
 # Gradient clipping: disabled. Normalization layers (LayerNorm, etc.) already keep gradients
 # in check; clipping was likely over-limiting updates and contributing to early plateau.
@@ -342,6 +342,8 @@ def validate(model, loader, criterion, device):
     best_t = max(VAL_THRESHOLDS, key=lambda t: mean_dice[t])
     avg_prob = sum_sigmoid_mean / n
     print(f"  Avg sigmoid = {avg_prob:.5f} | Max sigmoid = {max_sigmoid:.5f}")
+    pos_img_ratio = (masks.sum(dim=(1,2,3)) > 0).float().mean().item()
+    print(f"  % positive images in val batch = {pos_img_ratio:.3f}")
 
     return (
         total_loss / n,
