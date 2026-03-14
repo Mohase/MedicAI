@@ -33,7 +33,7 @@ if script_dir not in sys.path:
     sys.path.insert(0, script_dir)
 
 import torch 
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from torchvision import transforms
 import config
 import data_processing
@@ -67,7 +67,7 @@ WEIGHT_DECAY = 0.01
 VAL_RATIO = 0.2
 
 # Cosine annealing warm restarts: T_0=10 (first cycle 10 epochs), T_mult=2
-T_0 = 10
+T_0 = 8
 T_mult = 2
 
 # Early stopping: paper states patience > 10 epochs of no mIoU improvement. 
@@ -76,7 +76,7 @@ EARLY_STOP_PATIENCE = 80
 
 # Pixel threshold: paper specifies 0.5.
 # After sigmoid, pixels >= 0.5 are predicted as pneumothorax-
-PIXEL_TRESHOLD = 0.1
+PIXEL_TRESHOLD = 0.5
 
 # Validation: try multiple thresholds and report best Dice (and metrics at that threshold).
 VAL_THRESHOLDS = [0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5]
@@ -85,7 +85,7 @@ VAL_THRESHOLDS = [0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5]
 # Stronger push on positives (pos_weight, Dice weight) to raise probabilities and break 0.78 plateau.
 BCE_WEIGHT = 0.10
 DICE_WEIGHT = 0.85
-POS_WEIGHT = 320.0
+POS_WEIGHT = 320.0 # This is weight error. This is determined from -> neg_pixels / pos_pixels
 
 # Gradient clipping: disabled. Normalization layers (LayerNorm, etc.) already keep gradients
 # in check; clipping was likely over-limiting updates and contributing to early plateau.
@@ -111,11 +111,12 @@ BEST_MODEL_PATH = os.path.join(CHECKPOINT_DIR, "best_model.pth")
 # symmetric range works well with ReLU and batch norm.
 
 train_transform = transforms.Compose([
+    transforms.Normalize(mean=[0.5, 0.0], std=[0.5, 1.0]),
     transforms.RandomRotation(10),
     transforms.RandomHorizontalFlip(0.5),
-    transforms.RandomVerticalFlip(0.1),
-    transforms.RandomAffine(degrees=0, translate=(0.05, 0.05), scale=(0.9, 1.1)),
-    transforms.Normalize(mean=[0.5, 0.0], std=[0.5, 1.0]),
+    #transforms.RandomVerticalFlip(0.1),
+    #transforms.RandomAffine(degrees=0, translate=(0.05, 0.05), scale=(0.9, 1.1)),
+    
 ])
 
 # =============================
@@ -369,10 +370,12 @@ def main():
         mapping = data_processing.build_dicom_id_mapping()
         df = data_processing.add_file_id_column(df, dicom_id_mapping=mapping)
         data_processing.save_processed_data(df)
+        
 
     
     # 3. Merge multiple RLE rows per image into one row per image (union of masks)
     df = data_processing.merge_rle_rows(df, group_by="file_id")
+
 
     # 4. Split the data: train(60%), val(20%), test(20%)
     # Train = fit model.
@@ -382,6 +385,29 @@ def main():
     train_df, val_df, test_df = create_train_val_test_split(
         df, train_ratio=0.6, val_ratio=0.2, test_ratio=0.2
     )
+
+    # 5. Oversampling logic 
+    # 5.1 Locking in dataframe order once (apparently good practice)
+    train_df = train_df.reset_index(drop=True)
+
+    # 5.2 Creating positive / negative flags (merged df has EncodedPixels_list, not EncodedPixels)
+    train_df["is_positive"] = train_df["EncodedPixels_list"].apply(
+        lambda x: 1 if isinstance(x, list) and len(x) > 0 else 0
+    )
+
+    # 5.3 Create per image sample weights
+    # Positives -> 4x higher; comes from neg_cases/pos_cases
+    sample_weights = train_df['is_positive'].map({1: 4.0, 0: 1.0}).values
+
+    # 5.4 Creating the weighted sampler
+    sampler = WeightedRandomSampler(
+        weights = sample_weights,
+        num_samples = len(train_df), 
+        replacement = True
+    )
+
+
+     
 
     # 5. Dataset: train gets augmentation; val and test don't - for fair evaluation
     data_processing._build_dicom_path_cache(config.image_dir)
@@ -402,10 +428,17 @@ def main():
         target_size=TARGET_SIZE, transform=None
     )
 
+   
+
+
     # 6. Dataloader: batch the data; shuffle only training set
     train_loader = DataLoader(
-        train_ds, batch_size=BATCH_SIZE, shuffle=True,
-        num_workers=4, pin_memory=True, persistent_workers=True
+        train_ds,
+        batch_size=BATCH_SIZE, 
+        sampler=sampler,
+        num_workers=4, 
+        pin_memory=True, 
+        persistent_workers=True
     )
 
     val_loader = DataLoader(
