@@ -22,6 +22,7 @@ The following are parameters that were not found in the paper but were chosen ba
 import os
 import sys
 import json
+import numpy as np
 
 
 # ------------------------------------------------------------------
@@ -66,7 +67,7 @@ WEIGHT_DECAY = 0.01
 # Validation split: 20% for validation. Specified ratio in paper (6:2:2 ; Train, val, test)
 VAL_RATIO = 0.2
 
-# Cosine annealing warm restarts: T_0=10 (first cycle 10 epochs), T_mult=2
+# Cosine annealing warm restarts: T_0=8 (first cycle 8 epochs), T_mult=2
 T_0 = 8
 T_mult = 2
 
@@ -397,11 +398,14 @@ def main():
 
     # 5.3 Create per image sample weights
     # Positives -> 4x higher; comes from neg_cases/pos_cases
-    sample_weights = train_df['is_positive'].map({1: 4.0, 0: 1.0}).values
+    # Writable copy so PyTorch WeightedRandomSampler does not warn about non-writable tensors
+    sample_weights = np.array(
+        train_df["is_positive"].map({1: 4.0, 0: 1.0}).values, dtype=np.float64, copy=True
+    )
 
     # 5.4 Creating the weighted sampler
     sampler = WeightedRandomSampler(
-        weights = sample_weights,
+        weights=sample_weights,
         num_samples = len(train_df), 
         replacement = True
     )
